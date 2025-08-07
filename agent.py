@@ -1,4 +1,5 @@
 import asyncio
+import re
 from langgraph.graph import StateGraph, START, END
 from dataclasses import dataclass, field
 from typing import List, Any, Dict, Optional
@@ -22,8 +23,8 @@ class WorkflowState:
     messages: List[Any] = field(default_factory=list)
     current_state: str = "code"
     data: Dict[str, Any] = field(default_factory=dict)
-    retry_count: int = 0
-    max_retries: int = 4
+    retry_count: int = 1
+    max_retries: int = 3
 
 
 class BaseAgent(ABC):
@@ -46,50 +47,47 @@ class BaseAgent(ABC):
 class CodingAgent(BaseAgent):
     def __init__(self, name="CodingAgent"):
         super().__init__(name)
-        self.role = "CodingAgent"
-          
+        self.role = "CodingAgent"  
     async def process(self, state: WorkflowState) -> WorkflowState:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a helpful coding agent. Your task is to read and understand the user's query, and based on it, generate the necessary code implementation along with relevant test cases.
-            
-            If previous code and its execution status are provided, use them as a reference to improve or continue the work. If errors occurred, fix them.
-            If no prior context is given, generate the code and test cases from scratch according to the user's current request.
-            
-            Ensure your solution is correct, clean, and follows best practices.
-            
-            Format your response with clear sections for:
-            1. Main Code
-            2. Test Cases (if applicable)
-            3. Brief explanation
-            """),
-            ("human", """
-            Query: {query}
-            Previous Codes: {codes}
-            Previous Execution Status: {status}
-            Error Message (if any): {error}
-            
-            Please provide the appropriate code and test cases for the given query.
-            """)
-        ])
+        error_context = ""
+        if state.retry_count > 1:
+            error_msg = state.data.get('error_message', 'Unknown error')
+            error_context = f"\n\nPREVIOUS ERROR TO FIX:\n{error_msg}\n\nPlease fix the above error in your code."
         
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a code generator. Generate ONLY executable code.
+            STRICT REQUIREMENTS:
+            - Generate complete, runnable code
+            - Include all imports at the top
+            - Use proper syntax
+            - Add error handling and test cases
+            - Code must be self-contained and executable
+            - Do not include explanations outside the code
+            OUTPUT ONLY the code, nothing else."""),
+            ("human", """{query}{error_context}""")
+        ])
         try:
             chain = prompt | self.llm
             response = await chain.ainvoke({
                 "query": state.user_message,
-                "codes": state.data.get('code', 'None'),
-                "status": state.data.get('execution_status', 'None'),
-                "error": state.data.get('error_message', 'None')
+                "error_context": error_context
             })
             
-            state.data['code'] = response.content
-            self.add_message(state, response.content)
-            state.current_state = "execute"
+            content = response.content.strip()
+            
+            state.data['code'] = content
+            self.add_message(state, f"Code generated (attempt {state.retry_count}):\n{state.data['code']}\n\n")
+            
+            state.current_state = "execute" 
         except Exception as e:
             self.add_message(state, f"Code generation failed: {str(e)}")
             state.data['execution_status'] = 'failure'
             state.data['error_message'] = f"Code generation error: {str(e)}"
             state.current_state = "test"
-            
+        
+        print(f"\n=== ATTEMPT {state.retry_count} - GENERATED CODE ===")
+        print(state.data.get('code', 'No code generated'))
+        print("=" * 50)
         return state
 
 
@@ -98,21 +96,80 @@ class CodeExecutorAgent(BaseAgent):
         super().__init__(name)
         self.role = "ExecutionAgent"
         self._tools_cache = None
+        self._connection_attempts = 0
+        self._max_connection_attempts = 3
+    
+    def analyze_execution_result(self, response_content: str) -> tuple[bool, str]:
+        content = response_content.lower()
+        definite_errors = [
+            'traceback (most recent call last)',
+            'syntaxerror:',
+            'nameerror:',
+            'indentationerror:',
+            'typeerror:',
+            'valueerror:',
+            'attributeerror:',
+            'importerror:',
+            'modulenotfounderror:',
+            'keyerror:',
+            'indexerror:',
+            'zerodivisionerror:',
+            'execution failed',
+            'error occurred',
+            'failed to execute',
+            'unable to execute',
+            'internal error'
+            'fail',
+            'error',
+            'exception'
+            
+        ]
+        
+        success_indicators = [
+            'success',
+            'passed',
+            'executed successfully',
+            'completed successfully',
+            'execution completed',
+            'ran successfully',
+        ]
+        
+        if any(error in content for error in definite_errors):
+            return False, response_content
+            
+        if any(success in content for success in success_indicators):
+            return True, response_content
+            
+        if 'sorry' in content or 'unable' in content or 'cannot' in content:
+            return False, response_content
+            
+        return True, response_content
     
     async def get_interpreter_tools(self):
         if self._tools_cache is not None:
             return self._tools_cache
+        
+        self._connection_attempts += 1
+        if self._connection_attempts > self._max_connection_attempts:
+            print(f"Max connection attempts ({self._max_connection_attempts}) reached")
+            return []
             
         try:
             SERVER_URL = "http://127.0.0.1:8000/mcp"
+            print(f"Attempting to connect to MCP server (attempt {self._connection_attempts})...")
+            
             async with streamablehttp_client(SERVER_URL) as (read, write, _):
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = await load_mcp_tools(session)
+                    await asyncio.wait_for(session.initialize(), timeout=10)
+                    tools = await asyncio.wait_for(load_mcp_tools(session), timeout=10)
                     self._tools_cache = tools
+                    print(f"Successfully connected to MCP server with {len(tools)} tools")
                     return tools
+        except asyncio.TimeoutError:
+            print(f"Connection timeout on attempt {self._connection_attempts}")
+            return []
         except Exception as e:
-            print(f"Error connecting to MCP server: {e}")
+            print(f"Connection failed on attempt {self._connection_attempts}: {e}")
             return []
     
     async def process(self, state: WorkflowState) -> WorkflowState:
@@ -120,45 +177,60 @@ class CodeExecutorAgent(BaseAgent):
             tools = await self.get_interpreter_tools()
             if not tools:
                 state.data['execution_status'] = 'failure'
-                state.data['error_message'] = 'Could not connect to code execution server'
-                self.add_message(state, "Error: Could not connect to code execution server")
+                state.data['error_message'] = 'Could not connect to code execution server after multiple attempts'
+                self.add_message(state, "Error: Could not connect to MCP server")
                 state.current_state = "test"
                 return state
             
             agent = create_react_agent(model=self.llm, tools=tools)
             
+            execution_message = f"""Execute this code and show me the output:
+              {state.data['code']}
+              Run the code and tell me:
+              1. What output it produces
+              2. If there are any errors with details(failure or error or exception)
+              3. Whether it executed successfully(success or passed)"""
+            
             try:
+                print("Executing code...")
                 result = await asyncio.wait_for(
                     agent.ainvoke({
                         "messages": [
-                            {"role": "system", "content": "Execute the given code and test cases and give status as success or failure. If failure occurs, provide the error message as well."},
-                            {"role": "user", "content": f"User query: {state.user_message}\n\nCode to execute: {state.data['code']}"}
+                            {"role": "system", "content": "Execute the code provided by the user using given tools and report detailed results."},
+                            {"role": "user", "content": execution_message}
                         ]
                     }),
-                    timeout=60 
+                    timeout=45
                 )
                 
                 response_content = result["messages"][-1].content
+                print(f"\nExecution response: {response_content[:300]}...")
                 
-                fail_indicators = ['failure', 'failed', 'error', 'exception', 'bug', 'issue', 'traceback']
-                if any(indicator.lower() in response_content.lower() for indicator in fail_indicators):
-                    state.data['execution_status'] = 'failure'
-                    state.data['error_message'] = response_content
-                else:
+                is_successful, processed_response = self.analyze_execution_result(response_content)
+                
+                if is_successful:
                     state.data['execution_status'] = 'success'
-                    state.data['result'] = response_content
+                    state.data['result'] = processed_response
+                    state.data.pop('error_message', None)
+                    print("Execution marked as SUCCESS")
+                else:
+                    state.data['execution_status'] = 'failure'
+                    state.data['error_message'] = processed_response
+                    print("Execution marked as FAILURE")
                 
-                self.add_message(state, response_content)
+                self.add_message(state, f"Execution completed: {processed_response[:150]}...")
                 
             except asyncio.TimeoutError:
                 state.data['execution_status'] = 'failure'
-                state.data['error_message'] = "Code execution timed out after 60 seconds"
-                self.add_message(state, "Execution failed: Timeout after 60 seconds")
+                state.data['error_message'] = "Code execution timed out after 45 seconds"
+                self.add_message(state, "Execution failed: Timeout")
+                print("Execution TIMEOUT")
                 
         except Exception as e:
             state.data['execution_status'] = 'failure'
-            state.data['error_message'] = f"Execution error: {str(e)}"
-            self.add_message(state, f"Execution failed: {str(e)}")
+            state.data['error_message'] = f"Execution system error: {str(e)}"
+            self.add_message(state, f"Execution system error: {str(e)}")
+            print(f"Execution SYSTEM ERROR: {e}")
         
         state.current_state = "test"
         return state
@@ -172,19 +244,28 @@ class TestingAgent(BaseAgent):
     async def process(self, state: WorkflowState) -> WorkflowState:
         execution_status = state.data.get("execution_status", "failure")
         
+        print(f"\n=== TEST RESULTS ===")
+        print(f"Status: {execution_status}")
+        print(f"Attempt: {state.retry_count}")
+        
         if execution_status == 'failure':
             state.retry_count += 1
             
-            if state.retry_count >= state.max_retries:
-                self.add_message(state, f"Maximum retries ({state.max_retries}) reached. Ending workflow.")
+            if state.retry_count > state.max_retries:
+                print(f"Maximum retries ({state.max_retries}) exceeded")
+                self.add_message(state, f"Workflow failed after {state.max_retries} attempts")
                 state.current_state = "end"
             else:
-                self.add_message(state, f"Execution failed. Retry {state.retry_count}/{state.max_retries}. Going back to code generation.")
+                error_msg = state.data.get('error_message', 'Unknown error')
+                print(f"Retrying due to: {error_msg[:100]}...")
+                self.add_message(state, f"Retry {state.retry_count}: {error_msg[:100]}...")
                 state.current_state = "code"
         else:
-            self.add_message(state, "Code executed successfully!")
+            print(f"Success on attempt {state.retry_count}")
+            self.add_message(state, f"Workflow completed successfully on attempt {state.retry_count}")
             state.current_state = "end"
         
+        print("=" * 20)
         return state
 
 
@@ -206,10 +287,7 @@ class WorkflowManager:
         workflow.add_edge('execute', 'test')
         
         def decide_next_step(state: WorkflowState) -> str:
-            if state.current_state.lower() == "code":
-                return "code"
-            else:
-                return "end"
+            return "code" if state.current_state.lower() == "code" else "end"
         
         workflow.add_conditional_edges(
             "test",
@@ -255,22 +333,31 @@ async def main():
     try:
         manager = WorkflowManager()
         
-        user_query = "Create a Python function that calculates the factorial of a number and test it with a few examples."
+        user_query = "Create a Python program that calculates the factorial of a number and test it with several test cases including edge cases."
         
+        print(f"Starting workflow with query: {user_query}")
         result: WorkflowState = await manager.run_workflow(user_query)
         
-        print("=== Workflow Results ===")
+        print("\n" + "="*60)
+        print("FINAL WORKFLOW RESULTS")
+        print("="*60)
         print(f"Final State: {result['current_state']}")
-        print(f"Retry Count: {result['retry_count']}")
+        print(f"Total Attempts: {result['retry_count']}")
         print(f"Execution Status: {result['data'].get('execution_status', 'Unknown')}")
         
-        print("\n=== Messages ===")
-        for msg in result['messages']:
-            print(f"{msg}\n")
-        
         if result['data'].get('execution_status') == 'success':
-            print("=== Final Result ===")
+            print("\n WORKFLOW SUCCEEDED")
+            print("\n--- EXECUTION RESULT ---")
             print(result['data'].get('result', 'No result available'))
+            print("\n--- FINAL CODE ---")
+            print(result['data'].get('code', 'No code available'))
+        else:
+            print("\n WORKFLOW FAILED")
+            print("--- ERROR DETAILS ---")
+            print(result['data'].get('error_message', 'No error details available'))
+            if result['data'].get('code'):
+                print("\n--- LAST GENERATED CODE ---")
+                print(result['data'].get('code'))
             
     except Exception as e:
         print(f"Main execution error: {e}")
@@ -278,9 +365,10 @@ async def main():
         traceback.print_exc()
 
 
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Workflow interrupted by user")
+        print("\nWorkflow interrupted by user")
     except Exception as e:
         print(f"Critical error: {e}")

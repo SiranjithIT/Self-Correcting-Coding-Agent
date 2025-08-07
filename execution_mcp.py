@@ -143,6 +143,8 @@ class MCPCodeExecutor:
             with open(py_file, 'w') as f:
                 f.write(code)
             
+            logger.info("=== CODE TO EXECUTE ===\n%s\n=======================", code)  
+            
             result = subprocess.run(
                 ['python', py_file],
                 input=input_data,
